@@ -11,41 +11,60 @@ jobs:
       contents: write
       pages: write
       id-token: write
-      
+
     steps:
-    - name: Checkout
+    - name: Checkout Code
       uses: actions/checkout@v4
 
-    - name: Precheck Secrets
-      id: secret_check
+    - name: Validate Secrets
+      id: secret_validation
       run: |
-        # 强制验证密钥存在性
+        # 硬性密钥存在性检查
         if [ -z "${{ secrets.CF_TOKEN }}" ]; then
-          echo "::error::❌ 致命错误：CF_TOKEN未配置 → 请到仓库 Settings → Secrets → Actions 添加"
-          echo "::warning::创建指引：https://dash.cloudflare.com/profile/api-tokens"
-          echo "::warning::所需权限：Zone.Read + Radar.Read"
+          echo "::error::❌ 关键错误：CF_TOKEN未配置 → 立即修复：https://github.com/$GITHUB_REPOSITORY/settings/secrets/actions/new"
+          echo "::warning::名称必须严格使用「CF_TOKEN」"
+          echo "::warning::权限要求：Zone.Zone.Read + Radar.Radar.Read"
           exit 1
         fi
-        echo "✅ 密钥预检通过"
-
-    - name: Fetch IPs
+        
+        # 环境变量长度验证
+        TOKEN_LENGTH=${#SECRET_CONTENT}
+        if [ $TOKEN_LENGTH -lt 50 ]; then
+          echo "::error::❌ 密钥格式异常（有效Token应超过50字符）"
+          echo "::warning::请确认复制了完整的API Token"
+          exit 1
+        fi
+        echo "✅ 密钥基础验证通过"
       env:
-        CF_TOKEN: ${{ secrets.CF_TOKEN }}
-      run: |
-        # 带认证头的请求
-        curl -s -H "Authorization: Bearer $CF_TOKEN" \
-          "https://api.cloudflare.com/client/v4/radar/asns/6507/prefixes?format=json" \
-          -o riot_cache.json
+        SECRET_CONTENT: ${{ secrets.CF_TOKEN }}
 
-        # 认证失败诊断
-        if ! jq -e '.success == true' riot_cache.json >/dev/null; then
-          echo "::error::❌ Cloudflare API响应异常"
-          echo "::warning::错误详情：$(jq -c '.errors[0].message' riot_cache.json)"
-          echo "::warning::请确认：1.API Token有效 2.ASN编号正确"
+    - name: Fetch IP Data
+      env:
+        CF_API_TOKEN: ${{ secrets.CF_TOKEN }}
+      run: |
+        # 带失败重试的请求
+        RESPONSE=$(curl --retry 3 --fail-with-body -s \
+          -H "Authorization: Bearer $CF_API_TOKEN" \
+          "https://api.cloudflare.com/client/v4/radar/asns/6507/prefixes?format=json")
+
+        # API错误诊断
+        if ! jq -e '.success == true' <<< "$RESPONSE"; then
+          ERROR_MSG=$(jq -r '.errors[0].message' <<< "$RESPONSE")
+          echo "::error::❌ Cloudflare API错误：$ERROR_MSG"
+          echo "::warning::诊断建议："
+          echo "1. 访问 https://dash.cloudflare.com/profile/api-tokens"
+          echo "2. 确认Token包含以下权限："
+          echo "   - Zone.Zone.Read"
+          echo "   - Radar.Radar.Read"
           exit 1
         fi
 
-        # 生成规则文件
+        # 保存有效数据
+        jq '.' <<< "$RESPONSE" > riot_cache.json
+
+    - name: Generate Rules
+      run: |
+        # 生成YAML规则文件
         echo "payload:" > val-ip.yaml
         {
           echo "  - DOMAIN-SUFFIX,riotgames.com,🎮VALORANT"
@@ -56,10 +75,10 @@ jobs:
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: valorant-rules
+        name: game-rules
         path: val-ip.yaml
 
-    - name: Deploy Pages
+    - name: Deploy to GitHub Pages
       uses: peaceiris/actions-gh-pages@v3
       with:
         github_token: ${{ secrets.GITHUB_TOKEN }}
