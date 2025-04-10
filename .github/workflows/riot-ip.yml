@@ -1,8 +1,8 @@
 name: Riot IP Updater
 on:
   schedule:
-    - cron: "0 12 * * *"  # 每天UTC 12:00 (北京时间20:00) 更新
-  workflow_dispatch:      # 保留手动触发
+    - cron: "0 12 * * *"
+  workflow_dispatch:
 
 jobs:
   generate-rule:
@@ -12,8 +12,9 @@ jobs:
       uses: actions/checkout@v4
       
     - name: Fetch IPs
+      id: fetch_ips  # 添加步骤ID用于后续引用
       run: |
-        # 添加API缓存机制
+        # 添加API缓存机制（保持原有逻辑）
         if [ -f riot_cache.json ]; then
           etag=$(jq -r '.headers.etag[0]' riot_cache.json)
           curl -s -H "If-None-Match: $etag" \
@@ -22,22 +23,27 @@ jobs:
           
           if [ $? -eq 0 ] && [ -s new_data.json ]; then
             mv new_data.json riot_cache.json
+            echo "changed=true" >> $GITHUB_OUTPUT  # 设置输出变量
+          else
+            echo "nochanges" >> riot_cache.json
+            echo "changed=false" >> $GITHUB_OUTPUT
           fi
         else
           curl -s -D headers.txt \
             "https://api.cloudflare.com/client/v4/radar/asns/6507/prefixes?format=json" \
             -o riot_cache.json
+          echo "changed=true" >> $GITHUB_OUTPUT
         fi
 
-        # 生成规则文件
+        # 生成规则文件（保持原有逻辑）
         jq -r '.result.ipv4_prefixes[] | "  - IP-CIDR,\(.prefix),🎮VALORANT"' riot_cache.json > riot_rules.yaml
         echo -e "payload:\n- DOMAIN-SUFFIX,riotgames.com,🎮VALORANT\n- DOMAIN-SUFFIX,valorantgame.com,🎮VALORANT" | cat - riot_rules.yaml > val-ip.yaml
 
     - name: Conditional Upload
-      if: "! grep -q 'no changes' riot_cache.json"  # 仅在IP变化时上传
+      if: ${{ steps.fetch_ips.outputs.changed == 'true' }}  # 正确语法格式
       uses: peaceiris/actions-gh-pages@v3
       with:
         github_token: ${{ secrets.GITHUB_TOKEN }}
         publish_dir: ./
         publish_branch: gh-pages
-        force_orphan: true  # 避免保留历史版本
+        force_orphan: true
