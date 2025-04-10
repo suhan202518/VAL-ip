@@ -18,43 +18,49 @@ jobs:
     steps:
     - name: Checkout
       uses: actions/checkout@v4
-      
+      with:
+        fetch-depth: 0  # 强制拉取完整提交历史
+
     - name: Fetch IPs
       id: fetch_ips
       run: |
-        # 带认证的API请求
-        curl -s -H "Authorization: Bearer $CF_API_TOKEN" \
-          -H "Content-Type: application/json" \
-          "https://api.cloudflare.com/client/v4/radar/asns/6507/prefixes?format=json" \
-          -o riot_cache.json || echo "API_FAILED=true" >> $GITHUB_ENV
+        # 添加失败重试机制
+        for i in {1..3}; do
+          curl -s -H "Authorization: Bearer $CF_API_TOKEN" \
+            -H "Content-Type: application/json" \
+            "https://api.cloudflare.com/client/v4/radar/asns/6507/prefixes?format=json" \
+            -o riot_cache.json && break || sleep 10
+        done
 
-        # 添加IP数据有效性验证
-        if jq -e '.result.ipv4_prefixes' riot_cache.json >/dev/null; then
-          echo "changed=true" >> $GITHUB_OUTPUT
-        else
-          echo "::error::Invalid API response structure"
+        # 强化响应校验
+        if ! jq -e '.result.ipv4_prefixes | length > 0' riot_cache.json >/dev/null; then
+          echo "::error::Invalid or empty API response"
           exit 1
         fi
+        echo "changed=true" >> $GITHUB_OUTPUT
 
-        # 带容错的规则生成
+        # 生成带时间戳的规则文件
         {
+          echo "# Generated at: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
           echo "payload:"
           echo "  - DOMAIN-SUFFIX,riotgames.com,🎮VALORANT"
           echo "  - DOMAIN-SUFFIX,valorantgame.com,🎮VALORANT"
-          jq -r '.result.ipv4_prefixes[] | "  - IP-CIDR,\(.prefix),🎮VALORANT"' riot_cache.json 2>/dev/null
+          jq -r '.result.ipv4_prefixes[] | "  - IP-CIDR,\(.prefix),🎮VALORANT"' riot_cache.json
         } > val-ip.yaml
 
-    - name: Upload Artifact
-      uses: actions/upload-artifact@v3
+    - name: Upload Rules
+      uses: actions/upload-artifact@v4  # 升级到稳定版本
       with:
-        name: game-rules
+        name: valorant-rules
         path: val-ip.yaml
+        retention-days: 3  # 自动清理旧文件
 
-    - name: Deploy Pages
+    - name: Deploy to Pages
       if: ${{ success() && steps.fetch_ips.outputs.changed == 'true' }}
       uses: peaceiris/actions-gh-pages@v3
       with:
         github_token: ${{ secrets.GITHUB_TOKEN }}
         publish_dir: ./
         publish_branch: gh-pages
-        force_orphan: false  # 保留历史版本
+        keep_files: true  # 保留历史版本
+        force_orphan: false
