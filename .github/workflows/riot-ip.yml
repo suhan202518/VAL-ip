@@ -5,8 +5,7 @@ on:
   workflow_dispatch:
 
 env:
-  CF_API_KEY: ${{ secrets.CF_API_KEY }}
-  CF_EMAIL: ${{ secrets.CF_EMAIL }}
+  CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
 
 jobs:
   generate-rule:
@@ -22,53 +21,48 @@ jobs:
 
     - name: Validate Secrets
       run: |
-        if [ -z "$CF_API_KEY" ] || [ -z "$CF_EMAIL" ]; then
-          echo "::error::Cloudflare认证信息未正确配置"
+        # 安全调试输出（不打印密钥内容）
+        echo "密钥状态："
+        echo "CLOUDFLARE_API_TOKEN: ${#CLOUDFLARE_API_TOKEN} 字符"
+        if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
+          echo "::error::请在仓库Settings→Secrets中配置CLOUDFLARE_API_TOKEN"
+          echo "::warning::需要创建具备Zone.Read和Radar.Read权限的API Token"
           exit 1
         fi
 
     - name: Fetch IPs
       id: fetch_ips
       run: |
-        # 带自动认证切换的重试机制
+        # 带认证失败诊断的重试机制
         RETRY_COUNT=0
         MAX_RETRY=3
         while [ $RETRY_COUNT -lt $MAX_RETRY ]; do
           HTTP_CODE=$(curl -s -o riot_cache.json -w "%{http_code}" \
-            -H "X-Auth-Email: $CF_EMAIL" \
-            -H "X-Auth-Key: $CF_API_KEY" \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
             -H "Content-Type: application/json" \
             "https://api.cloudflare.com/client/v4/radar/asns/6507/prefixes?format=json")
-
-          # 双重认证方式兼容
-          if [ $HTTP_CODE -ne 200 ]; then
-            curl -s -o riot_cache.json \
-              -H "Authorization: Bearer $CF_API_KEY" \
-              -H "Content-Type: application/json" \
-              "https://api.cloudflare.com/client/v4/radar/asns/6507/prefixes?format=json"
-            HTTP_CODE=$?
-          fi
-
-          if [ $HTTP_CODE -eq 200 ] && jq -e '.success == true and .result.ipv4_prefixes? | length > 0' riot_cache.json >/dev/null; then
+          
+          if [ $HTTP_CODE -eq 200 ] && jq -e '.success == true and .result.ipv4_prefixes != null and (.result.ipv4_prefixes | length) > 0' riot_cache.json >/dev/null; then
             echo "API请求成功"
             break
           else
             RETRY_COUNT=$((RETRY_COUNT+1))
             echo "::warning::第${RETRY_COUNT}次请求失败 (HTTP ${HTTP_CODE})"
+            echo "响应摘要：$(jq -c '{success,errors}' riot_cache.json)"
             sleep 10
           fi
         done
 
         if [ $RETRY_COUNT -eq $MAX_RETRY ]; then
-          echo "::error::认证失败，请检查："
-          echo "1. 是否使用了Global API Key（需在Cloudflare控制台生成）"
-          echo "2. 是否开启Two-Factor认证（需关闭或使用API Token）"
+          echo "::error::最终失败响应："
           jq . riot_cache.json
+          echo "::warning::请检查：1.API Token权限 2.ASN编号是否正确"
           exit 1
         fi
 
         # 生成规则文件
-        echo "payload:" > val-ip.yaml
+        echo "# Auto-generated at: $(date -u +'%Y-%m-%dT%H:%M:%SZ')" > val-ip.yaml
+        echo "payload:" >> val-ip.yaml
         {
           echo "  - DOMAIN-SUFFIX,riotgames.com,🎮VALORANT"
           echo "  - DOMAIN-SUFFIX,valorantgame.com,🎮VALORANT"
