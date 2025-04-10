@@ -4,9 +4,6 @@ on:
     - cron: "0 12 * * *"
   workflow_dispatch:
 
-env:
-  CF_TOKEN: ${{ secrets.CF_TOKEN }}
-
 jobs:
   generate-rule:
     runs-on: ubuntu-latest
@@ -14,64 +11,37 @@ jobs:
       contents: write
       pages: write
       id-token: write
-      actions: read
       
     steps:
     - name: Checkout
       uses: actions/checkout@v4
 
-    - name: Validate Configuration
+    - name: Precheck Secrets
+      id: secret_check
       run: |
-        # 安全验证密钥状态
-        echo "配置诊断报告："
-        echo "----------------------------------"
-        echo "Secret名称: CF_TOKEN"
-        echo "字符长度: ${#CF_TOKEN}"
-        echo "首字符: ${CF_TOKEN:0:1}***${CF_TOKEN: -1}"
-        echo "----------------------------------"
-        
-        if [ -z "$CF_TOKEN" ]; then
-          echo "::error::❌ 密钥未配置 → 请到仓库Settings→Secrets→Actions创建CF_TOKEN"
-          echo "::warning::📝 创建指引：https://dash.cloudflare.com/profile/api-tokens"
+        # 强制验证密钥存在性
+        if [ -z "${{ secrets.CF_TOKEN }}" ]; then
+          echo "::error::❌ 致命错误：CF_TOKEN未配置 → 请到仓库 Settings → Secrets → Actions 添加"
+          echo "::warning::创建指引：https://dash.cloudflare.com/profile/api-tokens"
+          echo "::warning::所需权限：Zone.Read + Radar.Read"
           exit 1
         fi
+        echo "✅ 密钥预检通过"
 
     - name: Fetch IPs
-      id: fetch_ips
+      env:
+        CF_TOKEN: ${{ secrets.CF_TOKEN }}
       run: |
-        # 带调试信息的请求模块
-        DEBUG_FILE="api_debug.log"
-        
-        for i in {1..3}; do
-          echo "🔄 尝试第${i}次请求..."
-          HTTP_STATUS=$(
-            curl -si -o riot_cache.json -w "%{http_code}" \
-              -H "Authorization: Bearer $CF_TOKEN" \
-              -H "Content-Type: application/json" \
-              "https://api.cloudflare.com/client/v4/radar/asns/6507/prefixes?format=json" \
-              > $DEBUG_FILE
-          )
-          
-          # 解析响应头
-          CF_RAY=$(grep 'CF-RAY' $DEBUG_FILE | cut -d ' ' -f 2)
-          
-          if [ $HTTP_STATUS -eq 200 ]; then
-            echo "✅ 请求成功 (CF-RAY: ${CF_RAY})"
-            break
-          else
-            echo "::warning::⚠️ 请求失败 (HTTP ${HTTP_STATUS})"
-            echo "调试线索："
-            jq -c '{success,errors}' riot_cache.json
-            echo "CF-RAY追踪码: ${CF_RAY}"
-            sleep 10
-          fi
-        done
+        # 带认证头的请求
+        curl -s -H "Authorization: Bearer $CF_TOKEN" \
+          "https://api.cloudflare.com/client/v4/radar/asns/6507/prefixes?format=json" \
+          -o riot_cache.json
 
-        if [ $HTTP_STATUS -ne 200 ]; then
-          echo "::error::❌ 所有重试均失败"
-          echo "::warning::可能原因："
-          echo "1. 令牌权限不足（需要Zone.Read + Radar.Read）"
-          echo "2. ASN编号错误（当前查询AS6507）"
+        # 认证失败诊断
+        if ! jq -e '.success == true' riot_cache.json >/dev/null; then
+          echo "::error::❌ Cloudflare API响应异常"
+          echo "::warning::错误详情：$(jq -c '.errors[0].message' riot_cache.json)"
+          echo "::warning::请确认：1.API Token有效 2.ASN编号正确"
           exit 1
         fi
 
@@ -83,13 +53,13 @@ jobs:
           jq -r '.result.ipv4_prefixes[] | "  - IP-CIDR,\(.prefix),🎮VALORANT"' riot_cache.json
         } >> val-ip.yaml
 
-    - name: Upload Rules
+    - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
         name: valorant-rules
         path: val-ip.yaml
 
-    - name: Deploy to Pages
+    - name: Deploy Pages
       uses: peaceiris/actions-gh-pages@v3
       with:
         github_token: ${{ secrets.GITHUB_TOKEN }}
