@@ -18,49 +18,63 @@ jobs:
     steps:
     - name: Checkout
       uses: actions/checkout@v4
-      with:
-        fetch-depth: 0  # 强制拉取完整提交历史
 
     - name: Fetch IPs
       id: fetch_ips
       run: |
-        # 添加失败重试机制
-        for i in {1..3}; do
-          curl -s -H "Authorization: Bearer $CF_API_TOKEN" \
+        # 带状态码检查的重试机制
+        RETRY_COUNT=0
+        MAX_RETRY=3
+        while [ $RETRY_COUNT -lt $MAX_RETRY ]; do
+          HTTP_CODE=$(curl -s -o riot_cache.json -w "%{http_code}" \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
             -H "Content-Type: application/json" \
-            "https://api.cloudflare.com/client/v4/radar/asns/6507/prefixes?format=json" \
-            -o riot_cache.json && break || sleep 10
+            "https://api.cloudflare.com/client/v4/radar/asns/6507/prefixes?format=json")
+          
+          # 检查HTTP状态码和响应结构
+          if [ $HTTP_CODE -eq 200 ] && jq -e '.success == true and .result.ipv4_prefixes != null and (.result.ipv4_prefixes | length) > 0' riot_cache.json >/dev/null; then
+            echo "API请求成功"
+            break
+          else
+            RETRY_COUNT=$((RETRY_COUNT+1))
+            echo "::warning::第${RETRY_COUNT}次请求失败 (HTTP ${HTTP_CODE})"
+            sleep 15
+          fi
         done
 
-        # 强化响应校验
-        if ! jq -e '.result.ipv4_prefixes | length > 0' riot_cache.json >/dev/null; then
-          echo "::error::Invalid or empty API response"
+        # 最终失败处理
+        if [ $RETRY_COUNT -eq $MAX_RETRY ]; then
+          echo "::error::所有重试均失败，最后响应内容："
+          cat riot_cache.json
           exit 1
         fi
-        echo "changed=true" >> $GITHUB_OUTPUT
 
-        # 生成带时间戳的规则文件
+        # 生成带校验头的规则文件
         {
-          echo "# Generated at: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          echo "# Auto-generated at: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
           echo "payload:"
           echo "  - DOMAIN-SUFFIX,riotgames.com,🎮VALORANT"
           echo "  - DOMAIN-SUFFIX,valorantgame.com,🎮VALORANT"
           jq -r '.result.ipv4_prefixes[] | "  - IP-CIDR,\(.prefix),🎮VALORANT"' riot_cache.json
         } > val-ip.yaml
 
-    - name: Upload Rules
-      uses: actions/upload-artifact@v4  # 升级到稳定版本
+        # 二次文件校验
+        if [ $(wc -l < val-ip.yaml) -lt 3 ]; then
+          echo "::error::生成的规则文件异常，行数不足"
+          exit 1
+        fi
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
       with:
         name: valorant-rules
         path: val-ip.yaml
-        retention-days: 3  # 自动清理旧文件
 
-    - name: Deploy to Pages
-      if: ${{ success() && steps.fetch_ips.outputs.changed == 'true' }}
+    - name: Deploy Pages
+      if: ${{ success() }}
       uses: peaceiris/actions-gh-pages@v3
       with:
         github_token: ${{ secrets.GITHUB_TOKEN }}
         publish_dir: ./
         publish_branch: gh-pages
-        keep_files: true  # 保留历史版本
-        force_orphan: false
+        keep_files: true
