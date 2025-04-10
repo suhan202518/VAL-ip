@@ -1,0 +1,43 @@
+name: Riot IP Updater
+on:
+  schedule:
+    - cron: "0 12 * * *"  # 每天UTC 12:00 (北京时间20:00) 更新
+  workflow_dispatch:      # 保留手动触发
+
+jobs:
+  generate-rule:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      
+    - name: Fetch IPs
+      run: |
+        # 添加API缓存机制
+        if [ -f riot_cache.json ]; then
+          etag=$(jq -r '.headers.etag[0]' riot_cache.json)
+          curl -s -H "If-None-Match: $etag" \
+            "https://api.cloudflare.com/client/v4/radar/asns/6507/prefixes?format=json" \
+            -o new_data.json
+          
+          if [ $? -eq 0 ] && [ -s new_data.json ]; then
+            mv new_data.json riot_cache.json
+          fi
+        else
+          curl -s -D headers.txt \
+            "https://api.cloudflare.com/client/v4/radar/asns/6507/prefixes?format=json" \
+            -o riot_cache.json
+        fi
+
+        # 生成规则文件
+        jq -r '.result.ipv4_prefixes[] | "  - IP-CIDR,\(.prefix),🎮VALORANT"' riot_cache.json > riot_rules.yaml
+        echo -e "payload:\n- DOMAIN-SUFFIX,riotgames.com,🎮VALORANT\n- DOMAIN-SUFFIX,valorantgame.com,🎮VALORANT" | cat - riot_rules.yaml > val-ip.yaml
+
+    - name: Conditional Upload
+      if: "! grep -q 'no changes' riot_cache.json"  # 仅在IP变化时上传
+      uses: peaceiris/actions-gh-pages@v3
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        publish_dir: ./
+        publish_branch: gh-pages
+        force_orphan: true  # 避免保留历史版本
