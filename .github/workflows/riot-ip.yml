@@ -4,46 +4,57 @@ on:
     - cron: "0 12 * * *"
   workflow_dispatch:
 
+env:
+  CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+
 jobs:
   generate-rule:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+      
     steps:
     - name: Checkout
       uses: actions/checkout@v4
       
     - name: Fetch IPs
-      id: fetch_ips  # 添加步骤ID用于后续引用
+      id: fetch_ips
       run: |
-        # 添加API缓存机制（保持原有逻辑）
-        if [ -f riot_cache.json ]; then
-          etag=$(jq -r '.headers.etag[0]' riot_cache.json)
-          curl -s -H "If-None-Match: $etag" \
-            "https://api.cloudflare.com/client/v4/radar/asns/6507/prefixes?format=json" \
-            -o new_data.json
-          
-          if [ $? -eq 0 ] && [ -s new_data.json ]; then
-            mv new_data.json riot_cache.json
-            echo "changed=true" >> $GITHUB_OUTPUT  # 设置输出变量
-          else
-            echo "nochanges" >> riot_cache.json
-            echo "changed=false" >> $GITHUB_OUTPUT
-          fi
-        else
-          curl -s -D headers.txt \
-            "https://api.cloudflare.com/client/v4/radar/asns/6507/prefixes?format=json" \
-            -o riot_cache.json
+        # 带认证的API请求
+        curl -s -H "Authorization: Bearer $CF_API_TOKEN" \
+          -H "Content-Type: application/json" \
+          "https://api.cloudflare.com/client/v4/radar/asns/6507/prefixes?format=json" \
+          -o riot_cache.json || echo "API_FAILED=true" >> $GITHUB_ENV
+
+        # 添加IP数据有效性验证
+        if jq -e '.result.ipv4_prefixes' riot_cache.json >/dev/null; then
           echo "changed=true" >> $GITHUB_OUTPUT
+        else
+          echo "::error::Invalid API response structure"
+          exit 1
         fi
 
-        # 生成规则文件（保持原有逻辑）
-        jq -r '.result.ipv4_prefixes[] | "  - IP-CIDR,\(.prefix),🎮VALORANT"' riot_cache.json > riot_rules.yaml
-        echo -e "payload:\n- DOMAIN-SUFFIX,riotgames.com,🎮VALORANT\n- DOMAIN-SUFFIX,valorantgame.com,🎮VALORANT" | cat - riot_rules.yaml > val-ip.yaml
+        # 带容错的规则生成
+        {
+          echo "payload:"
+          echo "  - DOMAIN-SUFFIX,riotgames.com,🎮VALORANT"
+          echo "  - DOMAIN-SUFFIX,valorantgame.com,🎮VALORANT"
+          jq -r '.result.ipv4_prefixes[] | "  - IP-CIDR,\(.prefix),🎮VALORANT"' riot_cache.json 2>/dev/null
+        } > val-ip.yaml
 
-    - name: Conditional Upload
-      if: ${{ steps.fetch_ips.outputs.changed == 'true' }}  # 正确语法格式
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: game-rules
+        path: val-ip.yaml
+
+    - name: Deploy Pages
+      if: ${{ success() && steps.fetch_ips.outputs.changed == 'true' }}
       uses: peaceiris/actions-gh-pages@v3
       with:
         github_token: ${{ secrets.GITHUB_TOKEN }}
         publish_dir: ./
         publish_branch: gh-pages
-        force_orphan: true
+        force_orphan: false  # 保留历史版本
