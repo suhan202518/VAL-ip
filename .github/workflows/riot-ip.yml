@@ -1,4 +1,3 @@
-yaml
 name: Riot IP Updater
 on:
   schedule:
