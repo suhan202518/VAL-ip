@@ -19,7 +19,7 @@ jobs:
     - name: Validate Secrets
       id: secret_validation
       run: |
-        # 硬性密钥存在性检查
+        # 强化密钥验证逻辑
         if [ -z "${{ secrets.CF_TOKEN }}" ]; then
           echo "::error::❌ 关键错误：CF_TOKEN未配置 → 立即修复：https://github.com/$GITHUB_REPOSITORY/settings/secrets/actions/new"
           echo "::warning::名称必须严格使用「CF_TOKEN」"
@@ -27,44 +27,71 @@ jobs:
           exit 1
         fi
         
-        # 环境变量长度验证
-        TOKEN_LENGTH=${#SECRET_CONTENT}
+        # 长度验证增强
+        TOKEN_LENGTH=$(echo -n "${{ secrets.CF_TOKEN }}" | wc -c)
         if [ $TOKEN_LENGTH -lt 50 ]; then
           echo "::error::❌ 密钥格式异常（有效Token应超过50字符）"
-          echo "::warning::请确认复制了完整的API Token"
+          echo "::warning::当前Token长度：$TOKEN_LENGTH"
+          echo "::warning::请重新生成API Token：https://dash.cloudflare.com/profile/api-tokens"
           exit 1
         fi
         echo "✅ 密钥基础验证通过"
-      env:
-        SECRET_CONTENT: ${{ secrets.CF_TOKEN }}
 
     - name: Fetch IP Data
       env:
         CF_API_TOKEN: ${{ secrets.CF_TOKEN }}
       run: |
-        # 带失败重试的请求
-        RESPONSE=$(curl --retry 3 --fail-with-body -s \
+        set -eo pipefail  # 启用严格错误检查
+        
+        # 带调试信息的请求
+        RESPONSE=$(curl -v --retry 3 --fail-with-body -s \
           -H "Authorization: Bearer $CF_API_TOKEN" \
-          "https://api.cloudflare.com/client/v4/radar/asns/6507/prefixes?format=json")
+          "https://api.cloudflare.com/client/v4/radar/asns/6507/prefixes?format=json" 2>&1 | tee curl_output.log)
+        
+        # 增强错误处理
+        HTTP_STATUS=$(grep -oP 'HTTP/\d\.\d \K\d+' curl_output.log | tail -1)
+        if [ "$HTTP_STATUS" -ne 200 ]; then
+          echo "::error::❌ API请求失败 (HTTP $HTTP_STATUS)"
+          echo "::group::调试信息"
+          cat curl_output.log
+          echo "::endgroup::"
+          
+          case $HTTP_STATUS in
+            403)
+              echo "::warning::可能原因："
+              echo "1. Token权限不足（需要 Radar.Radar.Read）"
+              echo "2. 未绑定付款方式（部分雷达API需要付费账号）"
+              ;;
+            404)
+              echo "::warning::可能原因：ASN 6507不存在或不可访问"
+              ;;
+            *)
+              echo "::warning::建议检查：https://developers.cloudflare.com/api/health/"
+              ;;
+          esac
+          exit 1
+        fi
 
-        # API错误诊断
-        if ! jq -e '.success == true' <<< "$RESPONSE"; then
-          ERROR_MSG=$(jq -r '.errors[0].message' <<< "$RESPONSE")
-          echo "::error::❌ Cloudflare API错误：$ERROR_MSG"
-          echo "::warning::诊断建议："
-          echo "1. 访问 https://dash.cloudflare.com/profile/api-tokens"
-          echo "2. 确认Token包含以下权限："
-          echo "   - Zone.Zone.Read"
-          echo "   - Radar.Radar.Read"
+        # 验证JSON结构
+        if ! jq -e '.result.ipv4_prefixes' <<< "$RESPONSE" > /dev/null; then
+          echo "::error::❌ 响应数据格式异常"
+          echo "::warning::原始响应："
+          echo "$RESPONSE"
           exit 1
         fi
 
         # 保存有效数据
         jq '.' <<< "$RESPONSE" > riot_cache.json
+        echo "✅ 成功获取 $(jq '.result.ipv4_prefixes | length' riot_cache.json) 条IP记录"
 
     - name: Generate Rules
       run: |
-        # 生成YAML规则文件
+        # 添加数据有效性检查
+        if [ ! -s riot_cache.json ]; then
+          echo "::error::❌ 缓存文件为空"
+          exit 1
+        fi
+        
         echo "payload:" > val-ip.yaml
         {
           echo "  - DOMAIN-SUFFIX,riotgames.com,🎮VALORANT"
